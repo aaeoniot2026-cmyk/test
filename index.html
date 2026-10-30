@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>工單拍照上傳</title>
+<style>
+  :root { --bg:#111; --fg:#fff; --accent:#2e7dff; --ok:#2ecc71; --err:#ff5252; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,"Noto Sans TC","Microsoft JhengHei",sans-serif; }
+  .screen { position:fixed; inset:0; display:none; }
+  .screen.active { display:flex; }
+
+  /* 起始畫面 */
+  #sStart, #sResult { flex-direction:column; align-items:center; justify-content:center; gap:20px; padding:24px; text-align:center; }
+  h1 { font-size:26px; margin:0; }
+  input[type=text] { width:min(420px,90vw); font-size:24px; padding:14px 16px; border-radius:12px;
+    border:2px solid #444; background:#222; color:#fff; text-align:center; }
+  input[type=text]:focus { outline:none; border-color:var(--accent); }
+  button { font-size:20px; padding:14px 28px; border:0; border-radius:12px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.sec { background:#444; }
+  .hint { color:#aaa; font-size:14px; max-width:420px; }
+  .err { color:var(--err); min-height:1.2em; }
+
+  /* 相機畫面 */
+  #sCam { background:#000; }
+  #video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .top { position:absolute; top:0; left:0; right:0; padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 12px;
+    background:linear-gradient(#000a,transparent); display:flex; justify-content:space-between; font-size:18px; }
+  #thumbs { position:absolute; left:0; right:0; bottom:calc(env(safe-area-inset-bottom,0px) + 130px);
+    display:flex; gap:6px; padding:0 12px; overflow-x:auto; }
+  #thumbs div { position:relative; flex:0 0 auto; }
+  #thumbs img { height:64px; border-radius:6px; border:2px solid #fff8; display:block; }
+  #thumbs i { position:absolute; right:3px; bottom:3px; width:14px; height:14px; border-radius:50%; background:#f5a623; }
+  #thumbs i.done { background:var(--ok); } #thumbs i.fail { background:var(--err); }
+  .bottom { position:absolute; left:0; right:0; bottom:0; height:calc(env(safe-area-inset-bottom,0px) + 120px);
+    background:linear-gradient(transparent,#000a); }
+  #shutter { position:absolute; left:50%; bottom:calc(env(safe-area-inset-bottom,0px) + 24px); transform:translateX(-50%);
+    width:76px; height:76px; padding:0; border-radius:50%; background:#fff; border:5px solid #fff; outline:3px solid #fff8; outline-offset:3px; }
+  #shutter:active { transform:translateX(-50%) scale(.92); }
+  #btnEnd { position:absolute; right:calc(env(safe-area-inset-right,0px) + 20px);
+    bottom:calc(env(safe-area-inset-bottom,0px) + 30px); background:var(--err); }
+  #flash { position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .25s; }
+
+  /* 結果畫面 */
+  .result { font-size:34px; line-height:1.8; }
+  .okmark { font-size:56px; color:var(--ok); font-weight:700; }
+  .fail { color:var(--err); font-size:20px; }
+</style>
+</head>
+<body>
+
+<!-- 1. 輸入工單 -->
+<div class="screen active" id="sStart">
+  <h1>工單拍照</h1>
+  <input type="text" id="woInput" placeholder="輸入工單號碼" autocomplete="off" autocapitalize="characters">
+  <div class="err" id="startErr"></div>
+  <button id="btnStart">開始拍照</button>
+  <div class="hint" id="cfgHint"></div>
+</div>
+
+<!-- 2. 全螢幕相機 -->
+<div class="screen" id="sCam">
+  <video id="video" playsinline muted autoplay></video>
+  <div class="top"><span id="camWO"></span><span id="camCount">已拍 0 張</span></div>
+  <div id="thumbs"></div>
+  <div class="bottom"></div>
+  <button id="shutter" aria-label="拍照"></button>
+  <button id="btnEnd">結束</button>
+  <div id="flash"></div>
+</div>
+
+<!-- 3. 結果 -->
+<div class="screen" id="sResult">
+  <div class="result" id="resText"></div>
+  <div class="fail" id="resFail"></div>
+  <button id="btnRetry" class="sec" style="display:none">重試失敗的照片</button>
+  <button id="btnNew">拍下一張工單</button>
+</div>
+
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+/* ============ 設定 ============
+   APPS_SCRIPT_URL：貼上 Google Apps Script 部署後的網頁應用程式網址（以 /exec 結尾）
+   資料夾 ID 設定在 Apps Script 內（見說明）。 */
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzLxxxx0vCBgWUpc5YDnAstzDKzVCSre4AvBSg4-wCw6QoAN5kv7PAqCjqaMdVXD1UW/exec";
+const JPEG_QUALITY = 0.85;
+const MAX_SIDE = 2560;        // 照片長邊上限（像素），避免檔案過大
+
+const $ = id => document.getElementById(id);
+let stream = null, workOrder = "", photos = []; // {blob, name, status:'pending'|'done'|'fail', el}
+
+function show(id){ document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); $(id).classList.add('active'); }
+function getUrl(){ return APPS_SCRIPT_URL || localStorage.getItem('wp_url') || ""; }
+
+if(!getUrl()){
+  $('cfgHint').innerHTML = '尚未設定上傳網址。<br><a href="#" id="setUrl" style="color:#6aa8ff">點此貼上 Apps Script 網址</a>';
+  $('cfgHint').addEventListener('click', e=>{
+    if(e.target.id==='setUrl'){ e.preventDefault();
+      const u = prompt('貼上 Apps Script 網頁應用程式網址（/exec 結尾）');
+      if(u){ localStorage.setItem('wp_url', u.trim()); $('cfgHint').textContent='已儲存設定'; } }
+  });
+}
+
+/* 檔名/資料夾不允許的字元 */
+const safeName = s => s.trim().replace(/[\\\/:*?"<>|]/g,'_');
+
+$('btnStart').onclick = async () => {
+  const wo = safeName($('woInput').value);
+  if(!wo){ $('startErr').textContent='請輸入工單號碼'; return; }
+  if(!getUrl()){ $('startErr').textContent='請先設定上傳網址'; return; }
+  $('startErr').textContent='';
+  workOrder = wo; photos = [];
+  $('thumbs').innerHTML=''; updateCount();
+  try{
+    if(document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen().catch(()=>{});
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080} }, audio:false });
+    $('video').srcObject = stream;
+    $('camWO').textContent = '工單：' + workOrder;
+    show('sCam');
+  }catch(err){
+    $('startErr').textContent = '無法開啟相機：' + err.message + '（需使用 https 或 localhost，並允許相機權限）';
+  }
+};
+$('woInput').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btnStart').click(); });
+
+function updateCount(){ $('camCount').textContent = '已拍 ' + photos.length + ' 張'; }
+
+$('shutter').onclick = () => {
+  const v = $('video'); if(!v.videoWidth) return;
+  const scale = Math.min(1, MAX_SIDE / Math.max(v.videoWidth, v.videoHeight));
+  const c = $('canvas'); c.width = Math.round(v.videoWidth*scale); c.height = Math.round(v.videoHeight*scale);
+  c.getContext('2d').drawImage(v,0,0,c.width,c.height);
+  const f = $('flash'); f.style.opacity=.7; setTimeout(()=>f.style.opacity=0,80);
+  c.toBlob(blob=>{
+    const d = new Date(), p = n=>String(n).padStart(2,'0');
+    const ts = d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());
+    const photo = { blob, name:`${workOrder}_${ts}_${String(photos.length+1).padStart(2,'0')}.jpg`, status:'pending' };
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<img src="${URL.createObjectURL(blob)}"><i></i>`;
+    $('thumbs').appendChild(wrap); wrap.scrollIntoView({inline:'end'});
+    photo.el = wrap.querySelector('i');
+    photos.push(photo); updateCount();
+    upload(photo);                 // 拍完立刻背景上傳
+  }, 'image/jpeg', JPEG_QUALITY);
+};
+
+function blobToBase64(blob){
+  return new Promise((res,rej)=>{ const r=new FileReader();
+    r.onload=()=>res(r.result.split(',')[1]); r.onerror=rej; r.readAsDataURL(blob); });
+}
+
+async function upload(photo){
+  photo.status='pending'; photo.el.className='';
+  photo.promise = (async()=>{
+    try{
+      const data = await blobToBase64(photo.blob);
+      const resp = await fetch(getUrl(), {
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},   // 避免 CORS 預檢
+        body: JSON.stringify({ workOrder, fileName:photo.name, data })
+      });
+      const txt = await resp.text();
+      let j; try{ j = JSON.parse(txt); }catch(_){ throw new Error('伺服器回應不是 JSON（可能需要登入／部署權限不是「所有人」）：' + txt.slice(0,80).replace(/\s+/g,' ')); }
+      if(!j.ok) throw new Error(j.error||'upload failed');
+      photo.status='done'; photo.el.className='done';
+    }catch(e){ photo.status='fail'; photo.el.className='fail'; photo.err=String(e.message||e); console.error(e); }
+  })();
+  return photo.promise;
+}
+
+$('btnEnd').onclick = async () => {
+  if(!photos.length && !confirm('尚未拍任何照片，確定結束？')) return;
+  $('btnEnd').disabled = true; $('btnEnd').textContent = '上傳中…';
+  await Promise.all(photos.map(p=>p.promise));
+  stopCamera();
+  showResult();
+  $('btnEnd').disabled = false; $('btnEnd').textContent = '結束';
+};
+
+function showResult(){
+  const ok = photos.filter(p=>p.status==='done').length;
+  const fail = photos.length - ok;
+  $('resText').innerHTML = `工單 : ${workOrder}<br>儲存 : ${ok} 張<br><span class="okmark">${fail? '': 'ok'}</span>`;
+  const lastErr = (photos.filter(p=>p.status==='fail').pop()||{}).err||'';
+  $('resFail').textContent = fail ? `有 ${fail} 張上傳失敗：${lastErr}` : '';
+  $('btnRetry').style.display = fail ? '' : 'none';
+  show('sResult');
+}
+
+$('btnRetry').onclick = async () => {
+  $('btnRetry').disabled = true; $('btnRetry').textContent='重試中…';
+  await Promise.all(photos.filter(p=>p.status==='fail').map(upload));
+  $('btnRetry').disabled = false; $('btnRetry').textContent='重試失敗的照片';
+  showResult();
+};
+
+function stopCamera(){
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+}
+
+$('btnNew').onclick = () => { $('woInput').value=''; photos=[]; show('sStart'); $('woInput').focus(); };
+</script>
+</body>
+</html>
